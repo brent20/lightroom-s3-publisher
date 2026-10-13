@@ -31,6 +31,7 @@ provider.supportsIncrementalPublish = true -- true = usable from Export AND Publ
 provider.canExportVideo = false
 provider.hideSections = { 'exportLocation' }
 provider.hidePrintResolution = true
+provider.small_icon = 'small_icon.png'
 
 provider.exportPresetFields = {
   { key = 'accessKey', default = '' },
