@@ -1,222 +1,267 @@
 -- S3Upload.lua
--- Uploads files to S3 / Cloudflare R2 using AWS Signature Version 4.
--- macOS: uses /usr/bin/curl + sips
--- Windows: uses curl (built-in Win10/11) + ImageMagick (magick) for thumbnails
+-- Thin S3 / Cloudflare R2 client built on the system curl (--aws-sigv4, needs curl >= 7.75).
+--
+-- Credentials and request details are written to a short-lived curl config file (-K) so the
+-- secret key never appears on the command line / in the process list.
 
-local LrDate = import 'LrDate'
-local sha256  = require 'sha256'
+local LrFileUtils = import 'LrFileUtils'
+local LrPathUtils = import 'LrPathUtils'
+local LrTasks = import 'LrTasks'
+local LrMD5 = import 'LrMD5'
+local LrLogger = import 'LrLogger'
+
+local logger = LrLogger('S3Upload')
+logger:enable('logfile') -- ~/Documents/LrClassicLogs/S3Upload.log
+
 local M = {}
 
--- ── OS detection ──────────────────────────────────────────────
--- WIN_ENV är en global som Lightroom sätter på Windows
-local IS_WIN = (WIN_ENV ~= nil)
+local MAX_ATTEMPTS = 3
 
--- ── helpers ───────────────────────────────────────────────────
+---------------------------------------------------------------------------
+-- helpers
+---------------------------------------------------------------------------
 
-local function encode_path(s)
-  return (s:gsub('[^A-Za-z0-9%-_%.~/]', function(c)
-    return string.format('%%%02X', c:byte())
+local function trim(s)
+  s = tostring(s or '')
+  s = s:gsub('^%s+', '')
+  s = s:gsub('%s+$', '')
+  return s
+end
+
+-- Quote a value for the shell command line.
+local function shq(s)
+  if WIN_ENV then
+    return '"' .. s .. '"'
+  end
+  local escaped = s:gsub("'", "'\\''")
+  return "'" .. escaped .. "'"
+end
+
+-- Quote a value for a curl config file (backslash and double quote are escapes there).
+local function cq(s)
+  local escaped = tostring(s):gsub('\\', '\\\\')
+  escaped = escaped:gsub('"', '\\"')
+  return '"' .. escaped .. '"'
+end
+
+local counter = 0
+local function tempPath(ext)
+  counter = counter + 1
+  local seed = tostring(os.time()) .. tostring(os.clock()) .. counter .. tostring(math.random())
+  local name = 's3up-' .. LrMD5.digest(seed) .. (ext or '')
+  return LrPathUtils.child(LrPathUtils.getStandardFilePath('temp'), name)
+end
+
+local function writeFile(path, contents)
+  local fh = io.open(path, 'wb')
+  if not fh then return false end
+  fh:write(contents)
+  fh:close()
+  return true
+end
+
+local function readFile(path)
+  if not LrFileUtils.exists(path) then return '' end
+  return LrFileUtils.readFile(path) or ''
+end
+
+local function removeFile(path)
+  if path and LrFileUtils.exists(path) then
+    LrFileUtils.delete(path)
+  end
+end
+
+-- Percent-encode an object key, keeping "/" separators.
+local function encodeKey(key)
+  return (key:gsub('[^%w%-%._~/]', function(c)
+    return string.format('%%%02X', string.byte(c))
   end))
 end
 
--- Shell-quote a string for the current OS
-local function sh(s)
-  if IS_WIN then
-    -- Windows cmd: wrap in double quotes, escape internal double quotes
-    return '"' .. s:gsub('"', '\\"') .. '"'
-  else
-    -- macOS/Linux: wrap in single quotes, escape internal single quotes
-    return "'" .. s:gsub("'", "'\\''") .. "'"
+local CONTENT_TYPES = {
+  jpg = 'image/jpeg', jpeg = 'image/jpeg', png = 'image/png',
+  tif = 'image/tiff', tiff = 'image/tiff', dng = 'image/x-adobe-dng',
+  gif = 'image/gif', webp = 'image/webp', json = 'application/json',
+}
+
+function M.contentTypeFor(path)
+  local ext = (LrPathUtils.extension(path) or ''):lower()
+  return CONTENT_TYPES[ext] or 'application/octet-stream'
+end
+
+---------------------------------------------------------------------------
+-- keys and URLs
+---------------------------------------------------------------------------
+
+-- "" or a prefix with no leading slash and exactly one trailing slash.
+function M.normalizePrefix(prefix)
+  prefix = trim(prefix)
+  prefix = prefix:gsub('^/+', '')
+  prefix = prefix:gsub('/+$', '')
+  if prefix == '' then return '' end
+  return prefix .. '/'
+end
+
+-- Thumbnail key that goes with a full-size key: <dir>/thumbs/<basename>.jpg
+function M.thumbKey(key)
+  local dir, leaf = key:match('^(.*/)([^/]+)$')
+  if not dir then
+    dir, leaf = '', key
   end
+  local base = leaf:gsub('%.[^%.]*$', '')
+  return dir .. 'thumbs/' .. base .. '.jpg'
 end
 
--- Platform-specific helpers
-local CURL     = IS_WIN and 'curl'         or '/usr/bin/curl'
-local DEV_NULL = IS_WIN and 'NUL'          or '/dev/null'
-local RM       = IS_WIN and 'del /f /q '   or 'rm -f '
-
-local function tmp_path(suffix)
-  local t = math.floor(LrDate.currentTime())
-  if IS_WIN then
-    return 'C:\\Windows\\Temp\\s3upload_' .. t .. (suffix or '')
-  else
-    -- Hämta hemkatalogen via shell (io.popen fungerar i LR)
-    local fh   = io.popen('echo $HOME')
-    local home = (fh and fh:read('*line') or ''):gsub('%s+$', '')
-    if fh then fh:close() end
-    local base = (home ~= '') and home or '/private/tmp'
-    return base .. '/.s3upload_' .. t .. (suffix or '')
+function M.objectUrl(settings, key)
+  local enc = encodeKey(key)
+  local endpoint = trim(settings.endpoint)
+  if endpoint ~= '' then
+    if not endpoint:match('^https?://') then
+      endpoint = 'https://' .. endpoint
+    end
+    endpoint = endpoint:gsub('/+$', '')
+    return endpoint .. '/' .. trim(settings.bucket) .. '/' .. enc
   end
+  return string.format('https://%s.s3.%s.amazonaws.com/%s',
+    trim(settings.bucket), trim(settings.region), enc)
 end
 
-local function mime_type(path)
-  local ext = (path:match('%.([^.]+)$') or ''):lower()
-  return ({ jpg='image/jpeg', jpeg='image/jpeg',
-            png='image/png', tif='image/tiff', tiff='image/tiff' })[ext]
-         or 'application/octet-stream'
+-- Public URL for a key if the user configured a public base URL (R2 custom domain etc).
+function M.publicUrl(settings, key)
+  local base = trim(settings.publicBaseUrl)
+  if base == '' then return nil end
+  base = base:gsub('/+$', '')
+  return base .. '/' .. encodeKey(key)
 end
 
-local function popen_read(cmd)
-  local fh  = io.popen(cmd)
-  local out = fh and fh:read('*all') or ''
-  if fh then fh:close() end
-  return out
-end
+---------------------------------------------------------------------------
+-- curl request
+---------------------------------------------------------------------------
 
--- ── core: upload one file via curl --aws-sigv4 ───────────────
+-- method: 'PUT' (needs opts.file) or 'DELETE'. Returns ok (bool), message (string).
+local function request(settings, method, key, opts)
+  opts = opts or {}
+  local url = M.objectUrl(settings, key)
+  local region = trim(settings.region)
+  if region == '' then region = 'auto' end
 
-local function put(p, file_path, s3_key)
-  local datetime = os.date('!%Y%m%dT%H%M%SZ')
-  local date     = os.date('!%Y%m%d')
-  local ctype    = mime_type(file_path)
+  local lastMessage = 'unknown error'
 
-  -- Build host + URI
-  local host, uri
-  if p.endpoint and p.endpoint ~= '' then
-    local ep = (p.endpoint:match('[^\r\n]+') or p.endpoint)
-      :gsub('%s', '')
-      :gsub('^https?://', '')
-      :gsub('/+$', '')
-    host = ep
-    uri  = '/' .. encode_path(p.bucket) .. '/' .. encode_path(s3_key)
-  else
-    host = p.bucket .. '.s3.' .. p.region .. '.amazonaws.com'
-    uri  = '/' .. encode_path(s3_key)
-  end
-  local url = 'https://' .. host .. uri
+  for attempt = 1, MAX_ATTEMPTS do
+    local cfg, out, codeFile, errFile = tempPath('.cfg'), tempPath('.out'), tempPath('.code'), tempPath('.err')
 
-  -- SigV4 signing (used as fallback via LrHttp)
-  local scope = date .. '/' .. p.region .. '/s3/aws4_request'
-  local canon_hdrs =
-    'content-type:'         .. ctype    .. '\n' ..
-    'host:'                 .. host     .. '\n' ..
-    'x-amz-content-sha256:UNSIGNED-PAYLOAD\n'   ..
-    'x-amz-date:'           .. datetime .. '\n'
-  local signed = 'content-type;host;x-amz-content-sha256;x-amz-date'
-  local canon  = table.concat({'PUT', uri, '', canon_hdrs, signed, 'UNSIGNED-PAYLOAD'}, '\n')
-  local sts    = table.concat({'AWS4-HMAC-SHA256', datetime, scope, sha256.sha256(canon)}, '\n')
-  local kd     = sha256.hmac_bin('AWS4' .. p.secret_key, date)
-  local sig    = sha256.hmac(sha256.hmac_bin(sha256.hmac_bin(sha256.hmac_bin(kd, p.region), 's3'), 'aws4_request'), sts)
-  local auth   = string.format(
-    'AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s',
-    p.access_key, scope, signed, sig)
-
-  -- ── Primary: curl --aws-sigv4 ────────────────────────────────
-  -- macOS: -k because LibreSSL has TLS compat issues with Cloudflare R2
-  -- Windows: no -k needed (uses Schannel/WinSSL which works fine)
-  local curl_flags = IS_WIN and '-sS' or '-sS -k'
-  local cmd = CURL .. ' ' .. curl_flags
-    .. ' -w "\\nHTTPSTATUS:%{http_code}"'
-    .. ' -X PUT'
-    .. ' --aws-sigv4 ' .. sh('aws:amz:' .. p.region .. ':s3')
-    .. ' --user '      .. sh(p.access_key .. ':' .. p.secret_key)
-    .. ' -H '          .. sh('Content-Type: ' .. ctype)
-    .. ' --data-binary ' .. sh('@' .. file_path)
-    .. ' '             .. sh(url)
-    .. ' 2>&1'
-
-  local cout = popen_read(cmd)
-  local cs   = tonumber(cout:match('HTTPSTATUS:(%d+)'))
-  if cs == 200 or cs == 204 then return true end
-
-  -- ── Fallback: LrHttp with our own SigV4 ─────────────────────
-  local LrHttp = import 'LrHttp'
-  local fh2, err2 = io.open(file_path, 'rb')
-  if not fh2 then return false, 'Cannot open file: ' .. (err2 or '?') end
-  local body = fh2:read('*all'); fh2:close()
-
-  local lrhdrs = {
-    { field = 'Authorization',        value = auth },
-    { field = 'Content-Type',         value = ctype },
-    { field = 'x-amz-content-sha256', value = 'UNSIGNED-PAYLOAD' },
-    { field = 'x-amz-date',           value = datetime },
-    { field = 'Content-Length',       value = tostring(#body) },
-  }
-  local resp_body, resp_hdrs = LrHttp.post(url, body, lrhdrs, 'PUT', 120)
-  local lrstatus = (type(resp_hdrs) == 'table' and resp_hdrs.status) or 0
-  if lrstatus == 200 or lrstatus == 204 then return true end
-
-  local cd = (cout:match('^(.-)%s*HTTPSTATUS:') or cout):gsub('%s+', ' '):sub(1, 120)
-  local ld = tostring(resp_body or ''):gsub('%s+', ' '):sub(1, 120)
-  return false, string.format('curl HTTP %s: %s | LrHttp HTTP %d: %s',
-    tostring(cs), cd, lrstatus, ld)
-end
-
--- ── thumbnail creation ────────────────────────────────────────
-
-local function make_thumb(src, max_px)
-  local dst = src:gsub('%.([^.]+)$', '_lrthumb.%1')
-
-  if IS_WIN then
-    -- Windows: use ImageMagick (magick) if available, else skip
-    local cmd = string.format('magick %s -resize %dx%d> %s 2>&1',
-      sh(src), max_px, max_px, sh(dst))
-    popen_read(cmd)
-  else
-    -- macOS: use sips (built-in)
-    local cmd = string.format('sips -Z %d %s --out %s > %s 2>&1',
-      max_px, sh(src), sh(dst), DEV_NULL)
-    popen_read(cmd)
-  end
-
-  local test = io.open(dst, 'rb')
-  if test then test:close(); return dst end
-
-  if IS_WIN then
-    return nil, 'Thumbnail failed — is ImageMagick installed? (https://imagemagick.org)'
-  end
-  return nil, 'sips failed'
-end
-
--- ── upload string content (for meta.json) ────────────────────
--- Skickar JSON direkt via --data utan tempfil
-
-function M.upload_string(p, content, s3_key)
-  local ep = (p.endpoint:match('[^\r\n]+') or p.endpoint)
-    :gsub('%s', ''):gsub('^https?://', ''):gsub('/+$', '')
-  local url = 'https://' .. ep .. '/' .. encode_path(p.bucket) .. '/' .. encode_path(s3_key)
-
-  local curl_flags = IS_WIN and '-sS' or '-sS -k'
-  local cmd = CURL .. ' ' .. curl_flags
-    .. ' -w "\\nHTTPSTATUS:%{http_code}"'
-    .. ' -X PUT'
-    .. ' --aws-sigv4 ' .. sh('aws:amz:' .. p.region .. ':s3')
-    .. ' --user '      .. sh(p.access_key .. ':' .. p.secret_key)
-    .. ' -H '          .. sh('Content-Type: application/json')
-    .. ' --data '      .. sh(content)
-    .. ' '             .. sh(url)
-    .. ' 2>&1'
-
-  local cout = popen_read(cmd)
-  local cs   = tonumber(cout:match('HTTPSTATUS:(%d+)'))
-  if cs == 200 or cs == 204 then return true end
-  return false, string.format('meta.json HTTP %s', tostring(cs))
-end
-
--- ── public API ────────────────────────────────────────────────
-
-function M.upload(p)
-  local ok, err = put(p, p.file_path, p.key)
-  if not ok then return false, err end
-
-  if p.thumb then
-    local dir, filename = p.key:match('^(.*)/([^/]+)$')
-    local thumb_key = dir and (dir .. '/thumbs/' .. filename) or ('thumbs/' .. p.key)
-
-    local thumb_path, thumb_err = make_thumb(p.file_path, p.thumb_size or 800)
-    if not thumb_path then
-      return true, 'Image uploaded, but thumbnail failed: ' .. (thumb_err or '?')
+    local lines = {
+      'silent',
+      'show-error',
+      'connect-timeout = 30',
+      'url = ' .. cq(url),
+      'user = ' .. cq(trim(settings.accessKey) .. ':' .. trim(settings.secretKey)),
+      'aws-sigv4 = ' .. cq('aws:amz:' .. region .. ':s3'),
+      'header = ' .. cq('x-amz-content-sha256: UNSIGNED-PAYLOAD'),
+      'output = ' .. cq(out),
+      'write-out = ' .. cq('%{http_code}'),
+    }
+    if method == 'PUT' then
+      lines[#lines + 1] = 'header = ' .. cq('Content-Type: ' .. (opts.contentType or M.contentTypeFor(opts.file)))
+      lines[#lines + 1] = 'upload-file = ' .. cq(opts.file)
+    else
+      lines[#lines + 1] = 'request = ' .. cq(method)
+    end
+    if settings.insecureTls then
+      lines[#lines + 1] = 'insecure'
     end
 
-    local tok, terr = put(p, thumb_path, thumb_key)
-    popen_read(RM .. sh(thumb_path))
+    local ok, message = false, nil
 
-    if not tok then
-      return true, 'Image uploaded, but thumbnail upload failed: ' .. (terr or '?')
+    if not writeFile(cfg, table.concat(lines, '\n') .. '\n') then
+      return false, 'could not write temporary curl config'
     end
+    if not WIN_ENV then
+      LrTasks.execute('/bin/chmod 600 ' .. shq(cfg))
+    end
+
+    local curl = WIN_ENV and 'curl' or '/usr/bin/curl'
+    local cmd = curl .. ' -K ' .. shq(cfg) .. ' > ' .. shq(codeFile) .. ' 2> ' .. shq(errFile)
+    if WIN_ENV then
+      cmd = '"' .. cmd .. '"'
+    end
+
+    local rc = LrTasks.execute(cmd)
+    local code = trim(readFile(codeFile))
+    local body = trim(readFile(out))
+    local err = trim(readFile(errFile))
+
+    removeFile(cfg); removeFile(out); removeFile(codeFile); removeFile(errFile)
+
+    if rc == 0 and code:match('^2%d%d$') then
+      ok = true
+    else
+      message = string.format('%s %s failed (curl exit %s, HTTP %s)', method, key, tostring(rc), code ~= '' and code or 'n/a')
+      if err ~= '' then message = message .. ': ' .. err:sub(1, 300) end
+      if body ~= '' then message = message .. ' | ' .. body:sub(1, 300) end
+      lastMessage = message
+      logger:warn(message)
+    end
+
+    if ok then
+      logger:info(string.format('%s %s OK (HTTP %s)', method, key, code))
+      return true, 'OK'
+    end
+
+    -- Retry only transient failures (network error or 5xx / throttling).
+    local transient = (rc ~= 0) or code:match('^5%d%d$') or code == '429' or code == '000'
+    if not transient or attempt == MAX_ATTEMPTS then
+      break
+    end
+    LrTasks.sleep(attempt)
   end
 
-  return true
+  return false, lastMessage
+end
+
+---------------------------------------------------------------------------
+-- public API
+---------------------------------------------------------------------------
+
+function M.put(settings, filePath, key, contentType)
+  return request(settings, 'PUT', key, { file = filePath, contentType = contentType })
+end
+
+function M.putString(settings, text, key, contentType)
+  local tmp = tempPath('.tmp')
+  if not writeFile(tmp, text) then
+    return false, 'could not write temporary file'
+  end
+  local ok, msg = request(settings, 'PUT', key, { file = tmp, contentType = contentType or 'application/octet-stream' })
+  removeFile(tmp)
+  return ok, msg
+end
+
+function M.delete(settings, key)
+  return request(settings, 'DELETE', key)
+end
+
+-- Creates a resized JPEG copy of srcPath in the temp folder. Returns its path, or nil.
+function M.makeThumb(settings, srcPath)
+  local size = tonumber(settings.thumbSize) or 800
+  local out = tempPath('.jpg')
+  local cmd
+  if WIN_ENV then
+    -- Needs ImageMagick on PATH; without it thumbnails are skipped.
+    cmd = '"magick ' .. shq(srcPath) .. ' -resize ' .. size .. 'x' .. size .. ' ' .. shq(out) .. '"'
+  else
+    cmd = '/usr/bin/sips -s format jpeg -Z ' .. size .. ' ' .. shq(srcPath) .. ' --out ' .. shq(out) .. ' > /dev/null 2>&1'
+  end
+  LrTasks.execute(cmd)
+  if LrFileUtils.exists(out) then
+    return out
+  end
+  logger:warn('thumbnail creation failed for ' .. srcPath)
+  return nil
+end
+
+function M.removeTemp(path)
+  removeFile(path)
 end
 
 return M
