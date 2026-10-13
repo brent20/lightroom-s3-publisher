@@ -7,6 +7,9 @@ A Lightroom Classic plugin that uploads photos to **Amazon S3**, **Cloudflare R2
 
 The publish service means your bucket can act as a living photo repository, much like the Flickr or Immich publish services.
 
+
+![S3 Publisher in Lightroom Library View](https://i.imgur.com/6Z2K4ag.png)
+
 ## Features
 
 - Export and Publish Service from the same plugin
